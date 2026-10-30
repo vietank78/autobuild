@@ -21,13 +21,6 @@ dependencies {
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 }
 
-processResources {
-    inputs.property 'version', project.version
-    filesMatching('fabric.mod.json') {
-        expand 'version': project.version
-    }
-}
-
 tasks.withType(JavaCompile).configureEach {
     it.options.release = 21
 }
