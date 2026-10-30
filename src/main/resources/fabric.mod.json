@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "autobuild",
-  "version": "${version}",
+  "version": "0.1.0",
   "name": "AutoBuild",
   "description": "Tự động xây công trình từ file schematic trong Fabric 1.21.11.",
   "authors": ["Your Name"],
