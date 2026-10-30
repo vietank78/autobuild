@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "autobuildpremium",
+  "version": "${version}",
+  "name": "AutoBuild Premium",
+  "description": "Đọc bản vẽ Litematica và xây chậm, an toàn, có xác minh và Repair Pass.",
+  "authors": ["AutoBuild Premium"],
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.autobuildpremium.AutoBuildPremium"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*",
+    "litematica": "*"
+  }
+}
