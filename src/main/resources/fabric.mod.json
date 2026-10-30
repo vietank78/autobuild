@@ -1,21 +1,20 @@
 {
   "schemaVersion": 1,
-  "id": "autobuild",
-  "version": "0.1.0",
-  "name": "AutoBuild",
-  "description": "Tự động xây công trình từ file schematic trong Fabric 1.21.11.",
-  "authors": ["Your Name"],
-  "license": "MIT",
+  "id": "autobuildpremium",
+  "version": "${version}",
+  "name": "AutoBuild Premium",
+  "description": "Đọc bản vẽ Litematica và xây chậm, an toàn, có xác minh và Repair Pass.",
+  "authors": ["AutoBuild Premium"],
+  "license": "All-Rights-Reserved",
   "environment": "client",
   "entrypoints": {
-    "client": [
-      "com.autobuild.AutoBuild$Client"
-    ]
+    "client": ["com.autobuildpremium.AutoBuildPremium"]
   },
   "depends": {
-    "fabricloader": ">=0.18.4",
+    "fabricloader": ">=0.18.0",
     "minecraft": "~1.21.11",
     "java": ">=21",
-    "fabric-api": "*"
+    "fabric-api": "*",
+    "litematica": "*"
   }
 }
