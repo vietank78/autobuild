@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "autobuild",
+  "version": "${version}",
+  "name": "AutoBuild",
+  "description": "Tự động xây công trình từ file schematic trong Fabric 1.21.11.",
+  "authors": ["Your Name"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.autobuild.AutoBuild$Client"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
