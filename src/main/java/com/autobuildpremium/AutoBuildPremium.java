@@ -7,6 +7,10 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
@@ -15,6 +19,9 @@ import net.minecraft.core.Vec3i;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
+import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -48,6 +55,9 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.TreeMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -89,12 +99,21 @@ public class AutoBuildPremium implements ClientModInitializer {
         public int walkTimeoutTicks = 20 * 60;
         /** true: so cả thuộc tính (hướng, trục, half...). Mặc định chỉ so loại block. */
         public boolean strictProperties = false;
+        /** Kiểm tra đủ vật liệu của TỪNG TẦNG trước khi xây tầng đó. */
+        public boolean checkLayerMaterials = true;
+        /** Tự chuyển vật liệu từ túi đồ lên hotbar. */
+        public boolean autoRestock = true;
+        /** true: bot tự đi tới chỗ cần xây. false: bạn tự đi, mod chỉ đặt block trong tầm với quanh bạn. */
+        public boolean autoWalk = false;
+        /** Xoay camera về điểm đặt (luôn xoay khi autoWalk bật). */
+        public boolean aimCamera = false;
     }
 
     public static final class BuildTarget {
         public final BlockPos pos;
         public final BlockState desired;
         public int attempts;
+        public int failCount;
         public String lastError = "";
 
         public BuildTarget(BlockPos pos, BlockState desired) {
@@ -122,6 +141,20 @@ public class AutoBuildPremium implements ClientModInitializer {
     private int placedOk = 0;
     private int repairRound = 0;
     private String pauseReason = "";
+
+    // Tầng
+    private final TreeMap<Integer, List<BuildTarget>> layers = new TreeMap<>();
+    private int activeLayerY = Integer.MIN_VALUE;
+    private Set<Item> layerNeeds = new HashSet<>();
+    private int minX = 0;
+
+    // Tiến độ (cache cho menu)
+    private int okCount = 0;
+    private long lastProgressMs = 0;
+
+    // Mở menu ở tick sau (chờ ChatScreen đóng)
+    private boolean pendingMenu = false;
+    private long lastHintMs = 0;
 
     // Đi bộ
     private Vec3 walkGoal = null;
@@ -239,32 +272,55 @@ public class AutoBuildPremium implements ClientModInitializer {
         return o != null && "NONE".equals(String.valueOf(o));
     }
 
+    /** Sắp xếp: tầng thấp lên cao; trong mỗi tầng đi theo hình rắn để đỡ phải chạy qua chạy lại. */
+    private void sortSnake(List<BuildTarget> list) {
+        list.sort(Comparator.comparingInt((BuildTarget t) -> t.pos.getY())
+                .thenComparingInt(t -> t.pos.getX())
+                .thenComparing((a, b) -> {
+                    int c = Integer.compare(a.pos.getZ(), b.pos.getZ());
+                    return ((a.pos.getX() - minX) & 1) == 1 ? -c : c;
+                }));
+    }
+
     /** Nạp mục tiêu, sắp xếp từ dưới lên theo tầng. */
     public void setTargets(List<BuildTarget> targets) {
         releaseKeys();
         allTargets.clear();
         allTargets.addAll(targets);
-        allTargets.sort(Comparator.comparingInt((BuildTarget t) -> t.pos.getY())
-                .thenComparingInt(t -> t.pos.getX())
-                .thenComparingInt(t -> t.pos.getZ()));
+        minX = allTargets.stream().mapToInt(t -> t.pos.getX()).min().orElse(0);
+        sortSnake(allTargets);
+        layers.clear();
+        for (BuildTarget t : allTargets) {
+            layers.computeIfAbsent(t.pos.getY(), k -> new ArrayList<>()).add(t);
+        }
         queue.clear();
         queue.addAll(allTargets);
         state = State.IDLE;
         mode = State.BUILD;
         current = null;
         aimedAt = null;
+        activeLayerY = Integer.MIN_VALUE;
+        layerNeeds = new HashSet<>();
         waitTicks = cooldownTicks = aimTicks = 0;
         consecutiveFailures = 0;
         placedOk = 0;
         repairRound = 0;
         pauseReason = "";
-        report("Đã nạp " + allTargets.size() + " block từ Litematica.");
+        refreshProgress();
+        report("Đã nạp " + allTargets.size() + " block, " + layers.size() + " tầng.");
     }
 
     // ------------------------------------------------------------------
     // Vòng lặp mỗi tick
     // ------------------------------------------------------------------
     private void tick() {
+        if (pendingMenu) {
+            Minecraft m = Minecraft.getInstance();
+            if (m.screen == null && m.player != null) {
+                pendingMenu = false;
+                m.setScreen(new AbpScreen(this));
+            }
+        }
         if (state == State.IDLE || state == State.PAUSED || state == State.COMPLETED) return;
 
         Minecraft mc = Minecraft.getInstance();
@@ -300,8 +356,156 @@ public class AutoBuildPremium implements ClientModInitializer {
             beginRepairPass();
             return;
         }
+        if (!config.autoWalk) {
+            pickNearby();
+            return;
+        }
+        int y = queue.peek().pos.getY();
+        if (y != activeLayerY && !enterLayer(y)) return;
         current = queue.poll();
         aimedAt = null;
+    }
+
+    /** Chế độ bạn tự đi: chọn block trong tầm với quanh bạn (tầng thấp trước, gần trước). */
+    private void pickNearby() {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        ClientLevel level = mc.level;
+        if (p == null || level == null) return;
+
+        Vec3 eye = p.getEyePosition();
+        double r = config.maxReachDistance;
+        double r2 = r * r;
+        BuildTarget best = null;
+        double bestD = 0;
+        Item missing = null;
+
+        java.util.Iterator<BuildTarget> it = queue.iterator();
+        while (it.hasNext()) {
+            BuildTarget t = it.next();
+            double d = eye.distanceToSqr(Vec3.atCenterOf(t.pos));
+            if (d > r2) continue;
+            if (matches(t)) {
+                it.remove();
+                placedOk++;
+                continue;
+            }
+            if (!level.getBlockState(t.pos).canBeReplaced()) continue;
+            Item need = t.desired.getBlock().asItem();
+            if (need == Items.AIR) continue;
+            if (countItem(p, need) <= 0) {
+                missing = need;
+                continue;
+            }
+            if (findSupportFace(level, t.pos) == null) continue;
+            if (!t.desired.getCollisionShape(level, t.pos).isEmpty()
+                    && p.getBoundingBox().intersects(new AABB(t.pos))) continue;
+
+            if (best == null || t.pos.getY() < best.pos.getY()
+                    || (t.pos.getY() == best.pos.getY() && d < bestD)) {
+                best = t;
+                bestD = d;
+            }
+        }
+
+        if (best != null) {
+            queue.remove(best);
+            current = best;
+            aimedAt = null;
+            activeLayerY = best.pos.getY();
+            return;
+        }
+
+        if (queue.isEmpty()) {
+            beginRepairPass();
+            return;
+        }
+        if (missing != null && System.currentTimeMillis() - lastHintMs > 8000) {
+            lastHintMs = System.currentTimeMillis();
+            report("Gần bạn còn thiếu vật liệu: " + new ItemStack(missing).getHoverName().getString());
+        }
+        cooldownTicks = 5;
+    }
+
+    /** Trả mục tiêu hiện tại về hàng đợi (dùng khi bạn đi quá xa hoặc đứng đè lên ô). */
+    private void releaseCurrent() {
+        if (current != null) queue.addLast(current);
+        current = null;
+        aimedAt = null;
+        cooldownTicks = 2;
+    }
+
+    /** Vào tầng mới: kiểm tra đủ vật liệu cho riêng tầng này. */
+    private boolean enterLayer(int y) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null) return false;
+
+        Map<Item, Integer> need = new LinkedHashMap<>();
+        int remaining = 0;
+        for (BuildTarget t : layers.getOrDefault(y, List.of())) {
+            if (matches(t)) continue;
+            remaining++;
+            Item it = t.desired.getBlock().asItem();
+            if (it == Items.AIR) continue;
+            need.merge(it, 1, Integer::sum);
+        }
+        layerNeeds = new HashSet<>(need.keySet());
+
+        if (config.checkLayerMaterials) {
+            StringBuilder miss = new StringBuilder();
+            int shown = 0;
+            for (Map.Entry<Item, Integer> e : need.entrySet()) {
+                int lack = e.getValue() - countItem(p, e.getKey());
+                if (lack <= 0) continue;
+                if (shown++ < 4) {
+                    if (miss.length() > 0) miss.append(", ");
+                    miss.append(new ItemStack(e.getKey()).getHoverName().getString()).append(" x").append(lack);
+                }
+            }
+            if (miss.length() > 0) {
+                pause("Tầng Y=" + y + " cần thêm: " + miss + (shown > 4 ? ", ..." : ""));
+                return false;
+            }
+        }
+
+        activeLayerY = y;
+        report("Bắt đầu tầng Y=" + y + " (" + remaining + " block).");
+        return true;
+    }
+
+    private static int countItem(LocalPlayer p, Item it) {
+        Inventory inv = p.getInventory();
+        int n = 0;
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack s = inv.getItem(i);
+            if (!s.isEmpty() && s.is(it)) n += s.getCount();
+        }
+        return n;
+    }
+
+    /** Chuyển vật liệu từ túi đồ (ô 9-35) lên hotbar. */
+    private boolean restock(Minecraft mc, LocalPlayer p, Item needed) {
+        if (mc.gameMode == null) return false;
+        Inventory inv = p.getInventory();
+        int from = -1;
+        for (int i = 9; i < 36; i++) {
+            ItemStack s = inv.getItem(i);
+            if (!s.isEmpty() && s.is(needed)) { from = i; break; }
+        }
+        if (from < 0) return false;
+
+        int to = -1;
+        for (int h = 0; h < 9 && to < 0; h++) {
+            if (inv.getItem(h).isEmpty()) to = h;
+        }
+        for (int h = 0; h < 9 && to < 0; h++) {
+            if (!layerNeeds.contains(inv.getItem(h).getItem())) to = h;
+        }
+        if (to < 0) to = 8;
+
+        mc.gameMode.handleInventoryMouseClick(p.inventoryMenu.containerId, from, to, ClickType.SWAP, p);
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -322,14 +526,23 @@ public class AutoBuildPremium implements ClientModInitializer {
             return;
         }
         int slot = findHotbarSlot(player, needed);
+        if (slot < 0 && config.autoRestock && restock(mc, player, needed)) {
+            waitTicks = 5;
+            return;
+        }
         if (slot < 0) {
+            if (!config.autoWalk) {
+                releaseCurrent();
+                return;
+            }
             pause("Thiếu vật liệu: " + t.desired.getBlock().getName().getString());
             return;
         }
 
         // 2. Tầm với: nếu xa thì tự đi tới gần
         if (isTooFar(player, t.pos)) {
-            startWalk(Vec3.atBottomCenterOf(t.pos), false);
+            if (config.autoWalk) startWalk(Vec3.atBottomCenterOf(t.pos), false);
+            else releaseCurrent();
             return;
         }
 
@@ -342,6 +555,10 @@ public class AutoBuildPremium implements ClientModInitializer {
         // 4. Không đứng đè lên ô đích
         if (!t.desired.getCollisionShape(level, t.pos).isEmpty()
                 && player.getBoundingBox().intersects(new AABB(t.pos))) {
+            if (!config.autoWalk) {
+                releaseCurrent();
+                return;
+            }
             Vec3 c = Vec3.atCenterOf(t.pos);
             double dx = player.getX() - c.x;
             double dz = player.getZ() - c.z;
@@ -355,6 +572,10 @@ public class AutoBuildPremium implements ClientModInitializer {
         // 5. Mặt hỗ trợ
         BlockHitResult hit = findSupportFace(level, t.pos);
         if (hit == null) {
+            if (!config.autoWalk) {
+                releaseCurrent();
+                return;
+            }
             t.attempts++;
             t.lastError = "Không có mặt hỗ trợ";
             cooldownTicks = config.stepDelayTicks;
@@ -362,12 +583,13 @@ public class AutoBuildPremium implements ClientModInitializer {
         }
         double hitMax = config.maxReachDistance + 0.4;
         if (player.getEyePosition().distanceToSqr(hit.getLocation()) > hitMax * hitMax) {
-            startWalk(Vec3.atBottomCenterOf(t.pos), false);
+            if (config.autoWalk) startWalk(Vec3.atBottomCenterOf(t.pos), false);
+            else releaseCurrent();
             return;
         }
 
         // 6. Quay mặt về điểm đặt, chờ vài tick cho server nhận hướng nhìn
-        if (aimedAt != t) {
+        if ((config.autoWalk || config.aimCamera) && aimedAt != t) {
             aimAt(player, hit.getLocation());
             aimedAt = t;
             aimTicks = config.aimTicks;
@@ -415,6 +637,7 @@ public class AutoBuildPremium implements ClientModInitializer {
         LOG.warn("Lỗi tại {}: {}", current.pos.toShortString(), reason);
         // Không dừng cả công trình: block lỗi sẽ được quét lại ở Repair Pass.
         current.attempts = 0;
+        if (!config.autoWalk && ++current.failCount < 3) queue.addLast(current);
         current = null;
         aimedAt = null;
         cooldownTicks = config.stepDelayTicks;
@@ -514,10 +737,9 @@ public class AutoBuildPremium implements ClientModInitializer {
     private void beginRepairPass() {
         List<BuildTarget> broken = allTargets.stream()
                 .filter(t -> !matches(t))
-                .sorted(Comparator.comparingInt((BuildTarget t) -> t.pos.getY())
-                        .thenComparingInt(t -> t.pos.getX())
-                        .thenComparingInt(t -> t.pos.getZ()))
-                .collect(Collectors.toList());
+                .collect(Collectors.toCollection(ArrayList::new));
+        sortSnake(broken);
+        activeLayerY = Integer.MIN_VALUE;
 
         if (broken.isEmpty()) {
             state = State.COMPLETED;
@@ -542,6 +764,7 @@ public class AutoBuildPremium implements ClientModInitializer {
         state = State.REPAIR;
         for (BuildTarget t : broken) {
             t.attempts = 0;
+            t.failCount = 0;
             queue.add(t);
         }
         report("Repair Pass " + repairRound + "/" + config.maxRepairRounds + ": " + broken.size() + " block cần sửa.");
@@ -613,26 +836,216 @@ public class AutoBuildPremium implements ClientModInitializer {
         String[] parts = cmd.split("\\s+");
         String sub = parts.length > 1 ? parts[1].toLowerCase() : "status";
         switch (sub) {
-            case "load" -> {
-                try {
-                    setTargets(readSelectedPlacement());
-                } catch (Exception e) {
-                    LOG.error("Không đọc được schematic", e);
-                    report("Không đọc được schematic: " + describe(e));
-                }
-            }
+            case "load" -> cmdLoad();
+            case "go" -> cmdLoadAndStart();
+            case "walk" -> setAutoWalk(!config.autoWalk);
+            case "menu", "gui" -> pendingMenu = true;
             case "start" -> start();
             case "pause" -> pause("người chơi yêu cầu");
             case "resume" -> resume();
             case "stop" -> emergencyStop();
             case "status" -> {
-                long ok = allTargets.stream().filter(this::matches).count();
-                report(String.format(
-                        "Trạng thái: %s | Đúng: %d/%d | Hàng đợi: %d | Lỗi liên tiếp: %d%s",
-                        state, ok, allTargets.size(), queue.size(), consecutiveFailures,
-                        pauseReason.isEmpty() ? "" : " | Lý do: " + pauseReason));
+                for (String line : statusLines()) report(line);
             }
-            default -> report("Lệnh: /abp load | start | pause | resume | stop | status");
+            default -> report("Lệnh: /abp menu | go | walk | load | start | pause | resume | stop | status");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Hành động dùng chung cho lệnh và menu
+    // ------------------------------------------------------------------
+    public boolean cmdLoad() {
+        try {
+            setTargets(readSelectedPlacement());
+            return true;
+        } catch (Exception e) {
+            LOG.error("Không đọc được schematic", e);
+            report("Không đọc được schematic: " + describe(e));
+            return false;
+        }
+    }
+
+    public void cmdLoadAndStart() {
+        if (cmdLoad()) start();
+    }
+
+    public void cmdStartOrResume() {
+        if (state == State.PAUSED) resume();
+        else start();
+    }
+
+    public Config config() {
+        return config;
+    }
+
+    /** Bật/tắt bot tự đi. Tắt: bạn tự đi, mod đặt block quanh bạn. */
+    public void setAutoWalk(boolean v) {
+        config.autoWalk = v;
+        if (!v) {
+            releaseKeys();
+            if (state == State.WALKING) {
+                state = mode;
+                releaseCurrent();
+            }
+        }
+        saveConfig();
+        report(v ? "Bot tự đi: BẬT." : "Bot tự đi: TẮT. Bạn tự đi, mod sẽ đặt block quanh bạn.");
+    }
+
+    /** Tốc độ: 0 chậm, 1 vừa, 2 nhanh, 3 rất nhanh. */
+    public int speedLevel() {
+        int d = config.stepDelayTicks;
+        if (d >= 18) return 0;
+        if (d >= 8) return 1;
+        if (d >= 3) return 2;
+        return 3;
+    }
+
+    public void cycleSpeed() {
+        int next = (speedLevel() + 1) % 4;
+        switch (next) {
+            case 0 -> { config.stepDelayTicks = 20; config.placeWaitTicks = 6; }
+            case 1 -> { config.stepDelayTicks = 10; config.placeWaitTicks = 4; }
+            case 2 -> { config.stepDelayTicks = 4; config.placeWaitTicks = 3; }
+            default -> { config.stepDelayTicks = 2; config.placeWaitTicks = 2; }
+        }
+        saveConfig();
+    }
+
+    public void refreshProgress() {
+        int n = 0;
+        for (BuildTarget t : allTargets) if (matches(t)) n++;
+        okCount = n;
+        lastProgressMs = System.currentTimeMillis();
+    }
+
+    private String stateName() {
+        return switch (state) {
+            case IDLE -> "Chờ lệnh";
+            case BUILD -> "Đang xây";
+            case REPAIR -> "Đang sửa lỗi (lượt " + repairRound + ")";
+            case WALKING -> "Đang di chuyển";
+            case PAUSED -> "Tạm dừng";
+            case COMPLETED -> "Hoàn thành";
+        };
+    }
+
+    public List<String> statusLines() {
+        if (System.currentTimeMillis() - lastProgressMs > 1000 && !allTargets.isEmpty()) refreshProgress();
+        List<String> out = new ArrayList<>();
+        out.add("Trạng thái: " + stateName());
+        out.add(config.autoWalk ? "Chế độ: Bot tự đi" : "Chế độ: Bạn tự đi, mod đặt block quanh bạn");
+        int total = allTargets.size();
+        out.add("Tiến độ: " + okCount + "/" + total + (total == 0 ? "" : " (" + (okCount * 100 / total) + "%)"));
+        int idx = 0;
+        if (activeLayerY != Integer.MIN_VALUE) {
+            for (Integer y : layers.keySet()) {
+                idx++;
+                if (y == activeLayerY) break;
+            }
+        }
+        out.add("Tầng: " + idx + "/" + layers.size() + (idx > 0 ? " (Y=" + activeLayerY + ")" : ""));
+        if (!pauseReason.isEmpty() && state == State.PAUSED) out.add("Lý do: " + pauseReason);
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Menu
+    // ------------------------------------------------------------------
+    public static class AbpScreen extends Screen {
+        private final AutoBuildPremium abp;
+        private Button btnSpeed, btnRestock, btnCheck, btnStrict, btnWalk, btnAim;
+
+        public AbpScreen(AutoBuildPremium abp) {
+            super(Component.literal("AutoBuild Premium"));
+            this.abp = abp;
+        }
+
+        private Button add(String label, int x, int y, int w, Button.OnPress action) {
+            return addRenderableWidget(Button.builder(Component.literal(label), action).bounds(x, y, w, 20).build());
+        }
+
+        @Override
+        protected void init() {
+            int w = 150, gap = 4, row = 22;
+            int left = this.width / 2 - w - gap / 2;
+            int right = this.width / 2 + gap / 2;
+            int y = Math.max(86, this.height - row * 7 - 6);
+
+            add("Nạp & Bắt đầu xây", this.width / 2 - w - gap / 2, y, w * 2 + gap, b -> {
+                abp.cmdLoadAndStart();
+                onClose();
+            });
+            y += row;
+            add("Bắt đầu / Tiếp tục", left, y, w, b -> {
+                abp.cmdStartOrResume();
+                onClose();
+            });
+            add("Tạm dừng", right, y, w, b -> abp.pause("người chơi yêu cầu"));
+            y += row;
+            add("Dừng khẩn cấp", left, y, w, b -> abp.emergencyStop());
+            add("Nạp lại bản vẽ", right, y, w, b -> abp.cmdLoad());
+            y += row;
+            btnWalk = add("", left, y, w, b -> { abp.setAutoWalk(!abp.config.autoWalk); refresh(); });
+            btnAim = add("", right, y, w, b -> {
+                abp.config.aimCamera = !abp.config.aimCamera;
+                abp.saveConfig();
+                refresh();
+            });
+            y += row;
+            btnSpeed = add("", left, y, w, b -> { abp.cycleSpeed(); refresh(); });
+            btnRestock = add("", right, y, w, b -> {
+                abp.config.autoRestock = !abp.config.autoRestock;
+                abp.saveConfig();
+                refresh();
+            });
+            y += row;
+            btnCheck = add("", left, y, w, b -> {
+                abp.config.checkLayerMaterials = !abp.config.checkLayerMaterials;
+                abp.saveConfig();
+                refresh();
+            });
+            btnStrict = add("", right, y, w, b -> {
+                abp.config.strictProperties = !abp.config.strictProperties;
+                abp.saveConfig();
+                refresh();
+            });
+            y += row;
+            add("Đóng", this.width / 2 - 50, y, 100, b -> onClose());
+            refresh();
+        }
+
+        private void refresh() {
+            String[] speeds = {"Chậm", "Vừa", "Nhanh", "Rất nhanh"};
+            btnWalk.setMessage(Component.literal("Bot tự đi: " + onOff(abp.config.autoWalk)));
+            btnAim.setMessage(Component.literal("Xoay camera khi đặt: " + onOff(abp.config.aimCamera)));
+            btnSpeed.setMessage(Component.literal("Tốc độ: " + speeds[abp.speedLevel()]));
+            btnRestock.setMessage(Component.literal("Tự lấy từ túi đồ: " + onOff(abp.config.autoRestock)));
+            btnCheck.setMessage(Component.literal("Kiểm tra vật liệu tầng: " + onOff(abp.config.checkLayerMaterials)));
+            btnStrict.setMessage(Component.literal("So sánh hướng block: " + onOff(abp.config.strictProperties)));
+        }
+
+        private static String onOff(boolean v) {
+            return v ? "Bật" : "Tắt";
+        }
+
+        @Override
+        public boolean isPauseScreen() {
+            return false;
+        }
+
+        @Override
+        public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+            super.render(g, mouseX, mouseY, delta);
+            Font f = this.font;
+            g.drawCenteredString(f, this.title, this.width / 2, 10, 0xFFFFFFFF);
+            int y = 26;
+            for (String line : abp.statusLines()) {
+                for (FormattedCharSequence seq : f.split(Component.literal(line), this.width - 20)) {
+                    g.drawCenteredString(f, seq, this.width / 2, y, 0xFFE0E0E0);
+                    y += 11;
+                }
+            }
         }
     }
 
